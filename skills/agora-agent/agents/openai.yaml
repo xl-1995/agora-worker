@@ -1,0 +1,3 @@
+display_name: AGORA Agent
+short_description: Process AGORA worker inbox tasks.
+default_prompt: Process AGORA worker tasks from inbox and write validated reports to outbox.
