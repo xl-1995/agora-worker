@@ -101,23 +101,32 @@ async function authenticate(cfg: WorkerConfig): Promise<{ token: string; account
 const authed = (token: string) => ({ "content-type": "application/json", authorization: `Bearer ${token}` });
 
 /**
- * Discover claimable open tasks.
- *  • If the agent has registered specialties (categories), match by those —
- *    this surfaces BOTH general tasks (chain null) and on-chain tasks in those
- *    categories, regardless of chain.
- *  • Otherwise fall back to the legacy caps + chain filter.
+ * Discover claimable open tasks. Early phase: ANY agent can claim ANY task, so
+ * we pull the whole open pool and sort the agent's registered specialties to
+ * the front — when several workers race for the same task, the best-matched one
+ * tends to claim first. In `--auto` (GoPlus-only) mode we keep just the on-chain
+ * tasks, since the built-in handler can't do general work.
  */
 async function pollOpen(cfg: WorkerConfig, token: string, categories: string[]): Promise<TaskRow[]> {
   const url = new URL(`${cfg.apiUrl}/tasks/open`);
-  if (categories.length > 0) {
-    url.searchParams.set("category", categories.join(","));
-  } else {
-    url.searchParams.set("caps", cfg.caps.join(","));
-    if (cfg.chain) url.searchParams.set("chain", cfg.chain);
-  }
+  url.searchParams.set("all", "1");
+  url.searchParams.set("limit", "50");
   const res = await fetch(url, { headers: authed(token) });
   if (!res.ok) throw new Error(`/tasks/open ${res.status}`);
-  return ((await res.json()) as { tasks: TaskRow[] }).tasks;
+  let tasks = ((await res.json()) as { tasks: TaskRow[] }).tasks;
+
+  // Auto mode only knows GoPlus contract scans.
+  if (cfg.auto) tasks = tasks.filter((t) => !!t.target_address);
+
+  // Specialty-first ordering (priority), then oldest-first within each group.
+  const cat = new Set(categories);
+  tasks.sort((a, b) => {
+    const ma = a.category && cat.has(a.category) ? 1 : 0;
+    const mb = b.category && cat.has(b.category) ? 1 : 0;
+    if (ma !== mb) return mb - ma;
+    return a.created_at - b.created_at;
+  });
+  return tasks;
 }
 
 /** Fetch the agent's registered specialty categories (empty if no profile). */
@@ -217,12 +226,12 @@ export async function startWorker(cfg: WorkerConfig, defaultHandler: (task: Task
 
   log(cfg.apiKey ? "logged in (API key)" : "logged in (SIWE)");
 
-  // Match by the agent's registered specialties when available.
+  // Any agent can claim any task; specialties just set claim priority.
   let categories = await fetchAgentCategories(cfg, token);
   if (categories.length > 0) {
-    log(`matching by specialties: [${categories.join(", ")}]`);
+    log(`claiming any open task; specialty priority: [${categories.join(", ")}]`);
   } else {
-    log("no agent profile found — register one at /app/agent to match general tasks by specialty. Falling back to caps + chain.");
+    log("claiming any open task. Register an identity at /app/agent to prioritize your specialties.");
   }
   let sinceProfileCheck = 0;
 
