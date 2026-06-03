@@ -100,13 +100,36 @@ async function authenticate(cfg: WorkerConfig): Promise<{ token: string; account
 // ------------------------------------------------------------ API helpers
 const authed = (token: string) => ({ "content-type": "application/json", authorization: `Bearer ${token}` });
 
-async function pollOpen(cfg: WorkerConfig, token: string): Promise<TaskRow[]> {
+/**
+ * Discover claimable open tasks.
+ *  • If the agent has registered specialties (categories), match by those —
+ *    this surfaces BOTH general tasks (chain null) and on-chain tasks in those
+ *    categories, regardless of chain.
+ *  • Otherwise fall back to the legacy caps + chain filter.
+ */
+async function pollOpen(cfg: WorkerConfig, token: string, categories: string[]): Promise<TaskRow[]> {
   const url = new URL(`${cfg.apiUrl}/tasks/open`);
-  url.searchParams.set("caps", cfg.caps.join(","));
-  if (cfg.chain) url.searchParams.set("chain", cfg.chain);
+  if (categories.length > 0) {
+    url.searchParams.set("category", categories.join(","));
+  } else {
+    url.searchParams.set("caps", cfg.caps.join(","));
+    if (cfg.chain) url.searchParams.set("chain", cfg.chain);
+  }
   const res = await fetch(url, { headers: authed(token) });
   if (!res.ok) throw new Error(`/tasks/open ${res.status}`);
   return ((await res.json()) as { tasks: TaskRow[] }).tasks;
+}
+
+/** Fetch the agent's registered specialty categories (empty if no profile). */
+async function fetchAgentCategories(cfg: WorkerConfig, token: string): Promise<string[]> {
+  try {
+    const res = await fetch(`${cfg.apiUrl}/agent/profile`, { headers: authed(token) });
+    if (!res.ok) return [];
+    const { profile } = (await res.json()) as { profile: { categories?: string[] } | null };
+    return Array.isArray(profile?.categories) ? profile!.categories! : [];
+  } catch {
+    return [];
+  }
 }
 
 async function claim(cfg: WorkerConfig, token: string, id: string): Promise<TaskRow | null> {
@@ -194,6 +217,15 @@ export async function startWorker(cfg: WorkerConfig, defaultHandler: (task: Task
 
   log(cfg.apiKey ? "logged in (API key)" : "logged in (SIWE)");
 
+  // Match by the agent's registered specialties when available.
+  let categories = await fetchAgentCategories(cfg, token);
+  if (categories.length > 0) {
+    log(`matching by specialties: [${categories.join(", ")}]`);
+  } else {
+    log("no agent profile found — register one at /app/agent to match general tasks by specialty. Falling back to caps + chain.");
+  }
+  let sinceProfileCheck = 0;
+
   // Make sure inbox/outbox dirs exist up-front in file-handoff mode.
   if (!cfg.auto) {
     await fs.mkdir(cfg.inbox, { recursive: true });
@@ -202,7 +234,17 @@ export async function startWorker(cfg: WorkerConfig, defaultHandler: (task: Task
 
   while (true) {
     try {
-      const open = await pollOpen(cfg, token);
+      // Re-check the profile occasionally so a newly-registered identity (or
+      // updated specialties) starts matching without a restart.
+      if (++sinceProfileCheck >= 20) {
+        sinceProfileCheck = 0;
+        const fresh = await fetchAgentCategories(cfg, token);
+        if (fresh.length > 0 && fresh.join(",") !== categories.join(",")) {
+          categories = fresh;
+          log(`specialties updated: [${categories.join(", ")}]`);
+        }
+      }
+      const open = await pollOpen(cfg, token, categories);
       for (const task of open) {
         const won = await claim(cfg, token, task.id);
         if (!won) continue;
