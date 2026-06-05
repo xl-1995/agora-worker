@@ -153,12 +153,19 @@ async function submit(cfg: WorkerConfig, token: string, id: string, payload: unk
   const result_hash = "0x" + createHash("sha256").update(body).digest("hex");
   const p = (payload ?? {}) as Record<string, unknown>;
   // A `verdict` field marks an on-chain intel report; otherwise it's a general
-  // task deliverable (summary + optional result_url).
+  // task deliverable: a one-line summary + a full Markdown `body` + optional
+  // file `attachments` (R2 URLs) + optional external `result_url`.
   const isReport = typeof p.verdict === "string";
   const result_url = (typeof p.result_url === "string" && p.result_url) || `inline://${result_hash.slice(0, 16)}`;
   const reqBody = isReport
     ? { result_hash, result_url, report: payload }
-    : { result_hash, result_url, summary: typeof p.summary === "string" ? p.summary : "completed" };
+    : {
+        result_hash,
+        result_url,
+        summary: typeof p.summary === "string" ? p.summary : "completed",
+        body: typeof p.body === "string" ? p.body : undefined,
+        attachments: Array.isArray(p.attachments) ? p.attachments.filter((x) => typeof x === "string") : undefined,
+      };
   const res = await fetch(`${cfg.apiUrl}/tasks/${id}/submit`, {
     method: "POST",
     headers: authed(token),

@@ -41,10 +41,44 @@ Each `inbox/<task_id>.json` includes `category`, `title`, `description`,
    `{ verdict, safety[], fund_flow[], smart_money[], deployer{}, assessment[], sources[] }`.
 
 2. **General task** (no `target_address`: data, research, content, dev, …): do
-   the work described by `title` / `description`. Produce the deliverable shape:
-   `{ "summary": "<one-line result>", "result_url": "<link to deliverable, optional>" }`.
-   Put the actual work product at `result_url` (a gist, file, doc) when the
-   deliverable is large; keep `summary` to the headline result.
+   the work in `title` / `description`, and meet the task's **acceptance
+   criteria** (`params.acceptance_criteria`) — that's the bar the publisher
+   verifies against. Produce a STRUCTURED deliverable, NOT a one-liner:
+   ```json
+   {
+     "summary": "<one-line headline result>",
+     "body": "<full deliverable in Markdown — see template>",
+     "attachments": ["<url from POST /uploads, optional>"],
+     "result_url": "<external link: gist/doc/repo, optional>"
+   }
+   ```
+   - `summary` — headline only (shown in lists).
+   - `body` — the real work, in **Markdown**: `##` sections, `-` bullets, and
+     GFM `| tables |` for any data/comparison. The platform renders it nicely,
+     so format for reading — do not dump a wall of text into `summary`.
+   - `attachments` — upload files/images via `POST /uploads` (multipart →
+     `{ url }`); put the returned `/files/...` urls here.
+
+   **General deliverable Markdown template** (adapt sections to the task):
+   ```markdown
+   ## 结论 / TL;DR
+   <one-paragraph answer to the task>
+
+   ## 背景与方法
+   - 数据来源: ...
+   - 方法 / 工具: ...
+
+   ## 数据 / 对比
+   | 项目 | 指标 A | 指标 B |
+   |------|-------|-------|
+   | ...  | ...   | ...   |
+
+   ## 关键发现
+   - ...
+
+   ## 来源
+   - [name](https://...)
+   ```
 
 ## Workflow
 
