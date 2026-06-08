@@ -11,12 +11,16 @@
  *        a) WORKER_AUTO=1 -> run the built-in default handler, OR
  *        b) write inbox/<id>.json, wait for outbox/<id>.json from your local agent.
  *   5. POST /tasks/:id/submit (auto-settles in V1 -> you get paid).
+ *
+ * Claimed tasks are processed concurrently (up to maxInflight) so a single
+ * long-running handoff never blocks the poll loop from claiming more work.
  */
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
+import { fetchJson, httpFetch, HttpError } from "./http.js";
 
 export interface WorkerConfig {
   apiUrl: string;
@@ -28,6 +32,7 @@ export interface WorkerConfig {
   outbox: string;
   pollMs: number;
   auto: boolean;
+  maxInflight: number;
 }
 
 export interface TaskRow {
@@ -49,19 +54,24 @@ export interface TaskRow {
   created_at: number;
 }
 
+const PROFILE_REFRESH_MS = 5 * 60_000;
+const DEFAULT_DEADLINE_MS = 10 * 60_000;
+const OUTBOX_POLL_MS = 2_000;
+
 const log = (s: string) => console.log(`[agora-worker] ${s}`);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // --------------------------------------------------------------- auth flow
 async function login(cfg: WorkerConfig, account: PrivateKeyAccount): Promise<string> {
   // 1. Ask the API for a nonce keyed to our address.
-  const nonceRes = await fetch(`${cfg.apiUrl}/auth/nonce`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ address: account.address }),
-  });
-  if (!nonceRes.ok) throw new Error(`/auth/nonce ${nonceRes.status}: ${await nonceRes.text()}`);
-  const { nonce, statement, domain } = (await nonceRes.json()) as { nonce: string; statement: string; domain: string };
+  const { nonce, statement, domain } = await fetchJson<{ nonce: string; statement: string; domain: string }>(
+    `${cfg.apiUrl}/auth/nonce`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ address: account.address }),
+    },
+  );
 
   // 2. Build the SIWE message (EIP-4361).
   const issuedAt = new Date().toISOString();
@@ -80,13 +90,11 @@ async function login(cfg: WorkerConfig, account: PrivateKeyAccount): Promise<str
   const signature = await account.signMessage({ message });
 
   // 3. Exchange for a JWT.
-  const verifyRes = await fetch(`${cfg.apiUrl}/auth/verify`, {
+  const { token } = await fetchJson<{ token: string }>(`${cfg.apiUrl}/auth/verify`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ message, signature }),
   });
-  if (!verifyRes.ok) throw new Error(`/auth/verify ${verifyRes.status}: ${await verifyRes.text()}`);
-  const { token } = (await verifyRes.json()) as { token: string };
   return token;
 }
 
@@ -102,29 +110,29 @@ const authed = (token: string) => ({ "content-type": "application/json", authori
 
 /**
  * Discover claimable open tasks. Early phase: ANY agent can claim ANY task, so
- * we pull the whole open pool and sort the agent's registered specialties to
- * the front — when several workers race for the same task, the best-matched one
- * tends to claim first. In `--auto` (GoPlus-only) mode we keep just the on-chain
- * tasks, since the built-in handler can't do general work.
+ * we pull the whole open pool and sort the agent's specialties to the front —
+ * when several workers race for the same task, the best-matched one tends to
+ * claim first. A task is "matched" when its category is one of the agent's
+ * registered specialties OR its kind is one of the configured `caps`. In
+ * `--auto` (GoPlus-only) mode we keep just the on-chain tasks, since the
+ * built-in handler can't do general work.
  */
 async function pollOpen(cfg: WorkerConfig, token: string, categories: string[]): Promise<TaskRow[]> {
   const url = new URL(`${cfg.apiUrl}/tasks/open`);
   url.searchParams.set("all", "1");
   url.searchParams.set("limit", "50");
-  const res = await fetch(url, { headers: authed(token) });
-  if (!res.ok) throw new Error(`/tasks/open ${res.status}`);
-  let tasks = ((await res.json()) as { tasks: TaskRow[] }).tasks;
+  let tasks = (await fetchJson<{ tasks: TaskRow[] }>(url, { headers: authed(token) })).tasks;
 
   // Auto mode only knows GoPlus contract scans.
   if (cfg.auto) tasks = tasks.filter((t) => !!t.target_address);
 
   // Specialty-first ordering (priority), then oldest-first within each group.
   const cat = new Set(categories);
+  const caps = new Set(cfg.caps);
+  const matched = (t: TaskRow) => (t.category && cat.has(t.category)) || caps.has(t.kind);
   tasks.sort((a, b) => {
-    const ma = a.category && cat.has(a.category) ? 1 : 0;
-    const mb = b.category && cat.has(b.category) ? 1 : 0;
-    if (ma !== mb) return mb - ma;
-    return a.created_at - b.created_at;
+    const d = Number(matched(b)) - Number(matched(a));
+    return d !== 0 ? d : a.created_at - b.created_at;
   });
   return tasks;
 }
@@ -132,9 +140,10 @@ async function pollOpen(cfg: WorkerConfig, token: string, categories: string[]):
 /** Fetch the agent's registered specialty categories (empty if no profile). */
 async function fetchAgentCategories(cfg: WorkerConfig, token: string): Promise<string[]> {
   try {
-    const res = await fetch(`${cfg.apiUrl}/agent/profile`, { headers: authed(token) });
-    if (!res.ok) return [];
-    const { profile } = (await res.json()) as { profile: { categories?: string[] } | null };
+    const { profile } = await fetchJson<{ profile: { categories?: string[] } | null }>(
+      `${cfg.apiUrl}/agent/profile`,
+      { headers: authed(token) },
+    );
     return Array.isArray(profile?.categories) ? profile!.categories! : [];
   } catch {
     return [];
@@ -142,9 +151,9 @@ async function fetchAgentCategories(cfg: WorkerConfig, token: string): Promise<s
 }
 
 async function claim(cfg: WorkerConfig, token: string, id: string): Promise<TaskRow | null> {
-  const res = await fetch(`${cfg.apiUrl}/tasks/${id}/claim`, { method: "POST", headers: authed(token) });
+  const res = await httpFetch(`${cfg.apiUrl}/tasks/${id}/claim`, { method: "POST", headers: authed(token) });
   if (res.status === 409) return null; // someone else won the race
-  if (!res.ok) throw new Error(`/tasks/${id}/claim ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new HttpError(res.status, `${cfg.apiUrl}/tasks/${id}/claim`, await res.text().catch(() => ""));
   return ((await res.json()) as { task: TaskRow }).task;
 }
 
@@ -166,16 +175,20 @@ async function submit(cfg: WorkerConfig, token: string, id: string, payload: unk
         body: typeof p.body === "string" ? p.body : undefined,
         attachments: Array.isArray(p.attachments) ? p.attachments.filter((x) => typeof x === "string") : undefined,
       };
-  const res = await fetch(`${cfg.apiUrl}/tasks/${id}/submit`, {
+  await fetchJson(`${cfg.apiUrl}/tasks/${id}/submit`, {
     method: "POST",
     headers: authed(token),
     body: JSON.stringify(reqBody),
   });
-  if (!res.ok) throw new Error(`/tasks/${id}/submit ${res.status}: ${await res.text()}`);
 }
 
 // --------------------------------------------------- file handoff with local LLM
-async function handoffToLocalAgent(cfg: WorkerConfig, task: TaskRow, deadlineMs: number): Promise<unknown> {
+async function handoffToLocalAgent(
+  cfg: WorkerConfig,
+  task: TaskRow,
+  deadlineMs: number,
+  stopping: () => boolean,
+): Promise<unknown> {
   await fs.mkdir(cfg.inbox, { recursive: true });
   await fs.mkdir(cfg.outbox, { recursive: true });
   const inboxPath = path.join(cfg.inbox, `${task.id}.json`);
@@ -203,24 +216,35 @@ async function handoffToLocalAgent(cfg: WorkerConfig, task: TaskRow, deadlineMs:
   await fs.writeFile(inboxPath, JSON.stringify(spec, null, 2));
   log(`inbox/${task.id}.json ready - run your local agent (Codex/Claude Code/etc.) on it.`);
 
-  // Poll for the outbox file.
-  const pollInterval = 2000;
-  while (Date.now() < deadlineMs) {
-    try {
-      const raw = await fs.readFile(outboxPath, "utf-8");
-      const parsed = JSON.parse(raw);
-      log(`outbox/${task.id}.json picked up.`);
-      // Clean up.
-      await fs.unlink(inboxPath).catch(() => {});
-      await fs.unlink(outboxPath).catch(() => {});
-      return parsed;
-    } catch {
-      // not yet - keep waiting
+  try {
+    // Poll for the outbox file. Read only once the file size is stable across two
+    // checks, so we never parse a half-written file the local agent is still writing.
+    let lastSize = -1;
+    while (Date.now() < deadlineMs && !stopping()) {
+      const stable = await stableFile(outboxPath, lastSize);
+      lastSize = stable.size;
+      if (stable.ready) {
+        const parsed = JSON.parse(await fs.readFile(outboxPath, "utf-8"));
+        log(`outbox/${task.id}.json picked up.`);
+        await fs.unlink(outboxPath).catch(() => {});
+        return parsed;
+      }
+      await sleep(OUTBOX_POLL_MS);
     }
-    await sleep(pollInterval);
+    throw new Error(stopping() ? "shutting_down" : "submit_deadline_exceeded");
+  } finally {
+    await fs.unlink(inboxPath).catch(() => {});
   }
-  await fs.unlink(inboxPath).catch(() => {});
-  throw new Error("submit_deadline_exceeded");
+}
+
+/** A file is "ready" once it exists, is non-empty, and its size held steady since the last poll. */
+async function stableFile(p: string, prevSize: number): Promise<{ ready: boolean; size: number }> {
+  try {
+    const { size } = await fs.stat(p);
+    return { ready: size > 0 && size === prevSize, size };
+  } catch {
+    return { ready: false, size: -1 };
+  }
 }
 
 // -------------------------------------------------------------------- loop
@@ -229,7 +253,7 @@ export async function startWorker(cfg: WorkerConfig, defaultHandler: (task: Task
   let token = initialToken;
   if (account) log(`agent address: ${account.address}`);
   if (cfg.apiKey) log("auth: AGORA_API_KEY");
-  log(`api: ${cfg.apiUrl} | caps: [${cfg.caps.join(", ")}] | chain: ${cfg.chain || "any"} | auto: ${cfg.auto}`);
+  log(`api: ${cfg.apiUrl} | caps: [${cfg.caps.join(", ")}] | chain: ${cfg.chain || "any"} | auto: ${cfg.auto} | maxInflight: ${cfg.maxInflight}`);
 
   log(cfg.apiKey ? "logged in (API key)" : "logged in (SIWE)");
 
@@ -240,7 +264,7 @@ export async function startWorker(cfg: WorkerConfig, defaultHandler: (task: Task
   } else {
     log("claiming any open task. Register an identity at /app/agent to prioritize your specialties.");
   }
-  let sinceProfileCheck = 0;
+  let lastProfileCheck = Date.now();
 
   // Make sure inbox/outbox dirs exist up-front in file-handoff mode.
   if (!cfg.auto) {
@@ -248,46 +272,82 @@ export async function startWorker(cfg: WorkerConfig, defaultHandler: (task: Task
     await fs.mkdir(cfg.outbox, { recursive: true });
   }
 
-  while (true) {
+  // Graceful shutdown: stop claiming on SIGINT/SIGTERM, let in-flight tasks drain.
+  let stopping = false;
+  const onStop = () => {
+    if (stopping) return;
+    stopping = true;
+    log("shutting down - draining in-flight tasks (Ctrl-C again to force quit)...");
+    process.once("SIGINT", () => process.exit(130));
+    process.once("SIGTERM", () => process.exit(143));
+  };
+  process.once("SIGINT", onStop);
+  process.once("SIGTERM", onStop);
+
+  // Tasks currently being processed; bounds concurrency and prevents re-claiming.
+  const inFlight = new Set<string>();
+
+  const reauth = async () => {
+    if (account) {
+      log("re-authenticating...");
+      try {
+        token = await login(cfg, account);
+      } catch (ee) {
+        log(`re-auth failed: ${ee}`);
+      }
+    } else {
+      log("API key rejected; create a fresh key in the AGORA web app.");
+    }
+  };
+
+  const processTask = async (task: TaskRow): Promise<void> => {
     try {
-      // Re-check the profile occasionally so a newly-registered identity (or
-      // updated specialties) starts matching without a restart.
-      if (++sinceProfileCheck >= 20) {
-        sinceProfileCheck = 0;
+      const won = await claim(cfg, token, task.id);
+      if (!won) return; // lost the race
+      log(`claimed ${task.id} (${task.kind} on ${task.chain} -> ${task.target_address})`);
+      const deadline = won.submit_deadline ?? Date.now() + DEFAULT_DEADLINE_MS;
+      const report = cfg.auto ? await defaultHandler(won) : await handoffToLocalAgent(cfg, won, deadline, () => stopping);
+      await submit(cfg, token, task.id, report);
+      log(`submitted ${task.id} - settled, payout received.`);
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 401) await reauth();
+      log(`${task.id} failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      inFlight.delete(task.id);
+    }
+  };
+
+  while (!stopping) {
+    try {
+      // Refresh the profile on a wall-clock interval so a newly-registered
+      // identity (or updated specialties) starts matching without a restart.
+      if (Date.now() - lastProfileCheck >= PROFILE_REFRESH_MS) {
+        lastProfileCheck = Date.now();
         const fresh = await fetchAgentCategories(cfg, token);
         if (fresh.length > 0 && fresh.join(",") !== categories.join(",")) {
           categories = fresh;
           log(`specialties updated: [${categories.join(", ")}]`);
         }
       }
+
       const open = await pollOpen(cfg, token, categories);
       for (const task of open) {
-        const won = await claim(cfg, token, task.id);
-        if (!won) continue;
-        log(`claimed ${task.id} (${task.kind} on ${task.chain} -> ${task.target_address})`);
-        try {
-          const deadline = won.submit_deadline ?? Date.now() + 10 * 60_000;
-          const report = cfg.auto ? await defaultHandler(won) : await handoffToLocalAgent(cfg, won, deadline);
-          await submit(cfg, token, task.id, report);
-          log(`submitted ${task.id} - settled, payout received.`);
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          log(`${task.id} failed: ${msg}`);
-        }
+        if (inFlight.size >= cfg.maxInflight) break; // at capacity; pick up the rest next poll
+        if (inFlight.has(task.id)) continue;
+        inFlight.add(task.id);
+        void processTask(task); // fire-and-forget; the poll loop keeps claiming
       }
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      log(`poll error: ${msg}`);
-      // re-auth on 401-ish errors
-      if (msg.includes("401")) {
-        if (account) {
-          log("re-authenticating...");
-          try { token = await login(cfg, account); } catch (ee) { log(`re-auth failed: ${ee}`); }
-        } else {
-          log("API key rejected; create a fresh key in the AGORA web app.");
-        }
-      }
+      if (e instanceof HttpError && e.status === 401) await reauth();
+      else log(`poll error: ${e instanceof Error ? e.message : String(e)}`);
     }
     await sleep(cfg.pollMs);
   }
+
+  // Drained on shutdown: wait for in-flight tasks (bounded by their own deadlines).
+  while (inFlight.size > 0) {
+    log(`waiting for ${inFlight.size} in-flight task(s) to finish...`);
+    await sleep(OUTBOX_POLL_MS);
+  }
+  log("clean shutdown.");
 }

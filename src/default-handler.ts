@@ -8,6 +8,7 @@
  */
 
 import type { TaskRow } from "./worker";
+import { fetchJson } from "./http.js";
 
 const GOPLUS_CHAIN_IDS: Record<string, string> = {
   bsc: "56",
@@ -21,18 +22,15 @@ export async function defaultIntelDeepHandler(task: TaskRow): Promise<unknown> {
   const target = task.target_address.toLowerCase();
   const chainId = GOPLUS_CHAIN_IDS[task.chain] ?? "56";
   const url = `https://api.gopluslabs.io/api/v1/token_security/${chainId}?contract_addresses=${target}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`goplus ${res.status}`);
-  const data = (await res.json()) as { code: number; message: string; result?: Record<string, GoPlusToken> };
+  const data = await fetchJson<{ code: number; message: string; result?: Record<string, GoPlusToken> }>(url);
   if (data.code !== 1 || !data.result) throw new Error(`goplus: ${data.message}`);
   const t = data.result[target];
   if (!t) throw new Error("goplus: token not indexed");
 
   const safety = mapSafety(t);
+  const verdict = computeVerdict(safety);
   const dangers = safety.filter((f) => f.status === "danger").length;
   const warns = safety.filter((f) => f.status === "warn").length;
-  const verdict =
-    dangers >= 3 ? "critical" : dangers >= 1 ? "high" : warns >= 3 ? "medium" : "low";
 
   return {
     token_name: t.token_name,
@@ -56,7 +54,23 @@ export async function defaultIntelDeepHandler(task: TaskRow): Promise<unknown> {
 }
 
 // ---------------------------------------------------------------- internal
-interface GoPlusToken {
+export type SafetyStatus = "pass" | "warn" | "danger";
+export interface SafetyFact {
+  key: string;
+  status: SafetyStatus;
+  value: string;
+}
+
+export type Verdict = "low" | "medium" | "high" | "critical";
+
+/** Roll a list of safety facts up into an overall verdict. */
+export function computeVerdict(safety: SafetyFact[]): Verdict {
+  const dangers = safety.filter((f) => f.status === "danger").length;
+  const warns = safety.filter((f) => f.status === "warn").length;
+  return dangers >= 3 ? "critical" : dangers >= 1 ? "high" : warns >= 3 ? "medium" : "low";
+}
+
+export interface GoPlusToken {
   token_name?: string;
   token_symbol?: string;
   is_honeypot?: string;
@@ -72,8 +86,8 @@ interface GoPlusToken {
   holders?: { percent?: string }[];
 }
 
-function mapSafety(t: GoPlusToken) {
-  const out: { key: string; status: "pass" | "warn" | "danger"; value: string }[] = [];
+export function mapSafety(t: GoPlusToken): SafetyFact[] {
+  const out: SafetyFact[] = [];
   out.push(boolFact("honeypot", t.is_honeypot, "Sellable", "Honeypot detected"));
   out.push(boolFact("mintable", t.is_mintable, "No mint function", "Owner can mint"));
   const privs = [t.can_take_back_ownership, t.hidden_owner, t.owner_change_balance, t.is_blacklisted].some((v) => v === "1");
@@ -82,19 +96,26 @@ function mapSafety(t: GoPlusToken) {
   out.push({ key: "tax", status: bt > 10 || st > 10 ? "danger" : bt > 5 || st > 5 ? "warn" : "pass", value: `Buy ${bt}% / Sell ${st}%` });
   const lpLocked = (t.lp_holders ?? []).filter((h) => Number(h.is_locked) === 1).reduce((s, h) => s + pct(h.percent), 0);
   out.push({ key: "lpLocked", status: lpLocked >= 80 ? "pass" : lpLocked > 0 ? "warn" : "danger", value: lpLocked > 0 ? `${Math.round(lpLocked)}% locked` : "Not locked" });
-  out.push(boolFact("verified", t.is_open_source, "Source verified", "Source not verified"));
+  // is_open_source has the opposite polarity: "1" = verified = good, "0" = bad.
+  out.push(
+    t.is_open_source === "1"
+      ? { key: "verified", status: "pass", value: "Source verified" }
+      : t.is_open_source === "0"
+        ? { key: "verified", status: "danger", value: "Source not verified" }
+        : { key: "verified", status: "warn", value: "Unknown" },
+  );
   const top10 = (t.holders ?? []).slice(0, 10).reduce((s, h) => s + pct(h.percent), 0);
   out.push({ key: "topHolders", status: top10 >= 75 ? "danger" : top10 >= 50 ? "warn" : "pass", value: top10 ? `Top 10 hold ${Math.round(top10)}%` : "Distribution unknown" });
   return out;
 }
 
-function boolFact(key: string, v: string | undefined, off: string, on: string): { key: string; status: "pass" | "warn" | "danger"; value: string } {
+function boolFact(key: string, v: string | undefined, off: string, on: string): SafetyFact {
   if (v === "1") return { key, status: "danger", value: on };
   if (v === "0") return { key, status: "pass", value: off };
   return { key, status: "warn", value: "Unknown" };
 }
 
-function pct(v: string | undefined): number {
+export function pct(v: string | undefined): number {
   if (v == null || v === "") return 0;
   const n = Number(v);
   if (!Number.isFinite(n)) return 0;

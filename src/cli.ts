@@ -14,7 +14,15 @@ import { promises as fs } from "node:fs";
 import { startWorker, type WorkerConfig } from "./worker.js";
 import { defaultIntelDeepHandler } from "./default-handler.js";
 
-const DEFAULT_API = "https://agora-api.chatnext.workers.dev";
+const DEFAULTS = {
+  api: "https://agora-api.chatnext.workers.dev",
+  caps: "intel.deep",
+  chain: "bsc",
+  pollMs: "15000",
+  inbox: "./inbox",
+  outbox: "./outbox",
+  maxInflight: "8",
+} as const;
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -28,10 +36,10 @@ function flag(name: string): boolean {
 const command = process.argv[2] && !process.argv[2].startsWith("--") ? process.argv[2] : "start";
 
 async function init(): Promise<void> {
-  const apiUrl = (arg("api") ?? process.env.AGORA_API_URL ?? DEFAULT_API).replace(/\/+$/, "");
+  const apiUrl = (arg("api") ?? process.env.AGORA_API_URL ?? DEFAULTS.api).replace(/\/+$/, "");
   const apiKey = arg("api-key") ?? process.env.AGORA_API_KEY;
-  const caps = arg("caps") ?? process.env.WORKER_CAPS ?? "intel.deep";
-  const chain = arg("chain") ?? process.env.WORKER_CHAIN ?? "bsc";
+  const caps = arg("caps") ?? process.env.WORKER_CAPS ?? DEFAULTS.caps;
+  const chain = arg("chain") ?? process.env.WORKER_CHAIN ?? DEFAULTS.chain;
   const auto = flag("auto") || process.env.WORKER_AUTO === "1" ? "1" : "0";
   if (!apiKey) {
     console.error("agora-worker init: missing --api-key. Create one in AGORA web app -> Agent Setup.");
@@ -42,9 +50,10 @@ async function init(): Promise<void> {
     `AGORA_API_KEY=${apiKey}`,
     `WORKER_CAPS=${caps}`,
     `WORKER_CHAIN=${chain}`,
-    `WORKER_INBOX=./inbox`,
-    `WORKER_OUTBOX=./outbox`,
-    `WORKER_POLL_MS=15000`,
+    `WORKER_INBOX=${DEFAULTS.inbox}`,
+    `WORKER_OUTBOX=${DEFAULTS.outbox}`,
+    `WORKER_POLL_MS=${DEFAULTS.pollMs}`,
+    `WORKER_MAX_INFLIGHT=${DEFAULTS.maxInflight}`,
     `WORKER_AUTO=${auto}`,
     "",
   ].join("\n");
@@ -61,15 +70,16 @@ if (command === "init") {
 }
 
 const cfg: WorkerConfig = {
-  apiUrl: (arg("api") ?? process.env.AGORA_API_URL ?? DEFAULT_API).replace(/\/+$/, ""),
+  apiUrl: (arg("api") ?? process.env.AGORA_API_URL ?? DEFAULTS.api).replace(/\/+$/, ""),
   privateKey: process.env.PRIVATE_KEY as `0x${string}` | undefined,
   apiKey: arg("api-key") ?? process.env.AGORA_API_KEY,
-  caps: (arg("caps") ?? process.env.WORKER_CAPS ?? "intel.deep").split(",").map((s) => s.trim()).filter(Boolean),
+  caps: (arg("caps") ?? process.env.WORKER_CAPS ?? DEFAULTS.caps).split(",").map((s) => s.trim()).filter(Boolean),
   chain: arg("chain") ?? process.env.WORKER_CHAIN ?? "",
-  inbox: arg("inbox") ?? process.env.WORKER_INBOX ?? "./inbox",
-  outbox: arg("outbox") ?? process.env.WORKER_OUTBOX ?? "./outbox",
-  pollMs: Number(arg("poll") ?? process.env.WORKER_POLL_MS ?? "15000"),
+  inbox: arg("inbox") ?? process.env.WORKER_INBOX ?? DEFAULTS.inbox,
+  outbox: arg("outbox") ?? process.env.WORKER_OUTBOX ?? DEFAULTS.outbox,
+  pollMs: Number(arg("poll") ?? process.env.WORKER_POLL_MS ?? DEFAULTS.pollMs),
   auto: flag("auto") || process.env.WORKER_AUTO === "1",
+  maxInflight: Math.max(1, Number(arg("max-inflight") ?? process.env.WORKER_MAX_INFLIGHT ?? DEFAULTS.maxInflight)),
 };
 
 if (!cfg.apiKey && !cfg.privateKey) {

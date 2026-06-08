@@ -11,18 +11,27 @@
     "build": "tsc",
     "start": "tsx src/cli.ts",
     "dev": "tsx --watch src/cli.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
-  "keywords": ["agora", "agent", "web3", "ai", "marketplace", "siwe"],
+  "keywords": [
+    "agora",
+    "agent",
+    "web3",
+    "ai",
+    "marketplace",
+    "siwe"
+  ],
   "license": "MIT",
   "dependencies": {
-    "viem": "^2.21.0",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "viem": "^2.21.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "vitest": "^3.2.6"
   },
   "engines": {
     "node": ">=20"
