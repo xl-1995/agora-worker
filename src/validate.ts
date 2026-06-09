@@ -31,7 +31,10 @@ export function validateDeliverable(payload: unknown, task: TaskRow): Validation
     return r;
   }
   if (task.target_address) validateReport(payload, r);
-  else validateGeneral(payload, r);
+  else {
+    validateGeneral(payload, r);
+    checkRelevance(payload, task, r);
+  }
   scanForSecrets(payload, r);
   return r;
 }
@@ -111,6 +114,102 @@ function validateGeneral(d: Record<string, unknown>, r: ValidationResult): void 
   if (nonEmptyStr(d.summary) && !hasBody && !hasLink) {
     r.warnings.push("deliverable is a one-line summary with no body or result_url — consider a Markdown body");
   }
+}
+
+// ----------------------------------------------------- answer ↔ question match
+//
+// A deterministic relevance gate: shape can be perfect while the answer ignores
+// the question. We can't *judge* semantic quality without a model, but we can
+// cheaply catch the gross mismatches — refusals, echoes of the prompt, and
+// acceptance criteria the deliverable never touches. These are warnings (with
+// one error for a blatant non-answer) so a false positive never blocks good work.
+
+const REFUSAL =
+  /\b(?:i (?:cannot|can'?t|am unable|was unable|won'?t|could not|couldn'?t)|as an ai|i (?:do|don'?t) (?:not )?have access|unable to (?:complete|access|provide)|insufficient (?:data|information|context) to|无法(?:完成|提供|访问)|不能完成)\b/i;
+
+// Small English stopword set so term-overlap keys on meaningful words.
+const STOPWORDS = new Set(
+  ("the a an and or of to in on for with from into over under this that these those is are was were be been being it its as by at about your you our we they them their his her per via such not no any all each both than then so but if when while which who whom whose what why how also more most into onto out up down off here there".split(
+    " ",
+  )),
+);
+
+/** Meaningful Latin tokens (≥4 chars, not stopwords). Chinese is handled via substring. */
+function salientTerms(s: string): string[] {
+  const toks = s.toLowerCase().match(/[a-z0-9]{4,}/g) ?? [];
+  return [...new Set(toks.filter((t) => !STOPWORDS.has(t)))];
+}
+
+function parseAcceptanceCriteria(task: TaskRow): string[] {
+  try {
+    const p = JSON.parse(task.params || "{}") as Record<string, unknown>;
+    const ac = p.acceptance_criteria;
+    if (Array.isArray(ac)) return ac.filter((x): x is string => typeof x === "string");
+    if (typeof ac === "string" && ac.trim()) return [ac.trim()];
+  } catch {
+    /* params not JSON — no criteria to check */
+  }
+  return [];
+}
+
+const norm = (s: string): string => s.toLowerCase().replace(/[^a-z0-9一-鿿]+/g, " ").trim();
+
+function checkRelevance(d: Record<string, unknown>, task: TaskRow, r: ValidationResult): void {
+  const summary = typeof d.summary === "string" ? d.summary : "";
+  const body = typeof d.body === "string" ? d.body : "";
+  const text = `${summary}\n${body}`;
+  const textLower = text.toLowerCase();
+  const hasBody = nonEmptyStr(body);
+  const hasLink = nonEmptyStr(d.result_url);
+
+  // Blatant non-answer: a short deliverable that reads as a refusal did no work.
+  if (REFUSAL.test(text) && text.trim().length < 400) {
+    r.errors.push("deliverable reads as a refusal / non-answer, not completed work");
+  }
+
+  // Echo: the summary just restates the task title and there's no body.
+  if (nonEmptyStr(task.title) && !hasBody && norm(summary) === norm(task.title)) {
+    r.warnings.push("summary just restates the task title — give the actual result, not the question");
+  }
+
+  // We can only inspect inline text. If the real work is behind result_url, skip
+  // coverage checks rather than warn on content we can't see.
+  const canInspect = hasBody || (!hasLink && nonEmptyStr(summary));
+  if (!canInspect) return;
+
+  // Acceptance criteria: warn on any criterion the deliverable plainly ignores.
+  const criteria = parseAcceptanceCriteria(task);
+  for (const c of criteria) {
+    if (!addressesCriterion(c, text, textLower)) {
+      const label = c.length > 60 ? c.slice(0, 57) + "…" : c;
+      r.warnings.push(`deliverable may not satisfy acceptance criterion: "${label}"`);
+    }
+  }
+
+  // No explicit criteria → fall back to term overlap with the task's own wording.
+  if (criteria.length === 0) {
+    const terms = salientTerms(`${task.title ?? ""} ${task.description ?? ""}`);
+    if (terms.length >= 4) {
+      const hit = terms.filter((t) => textLower.includes(t)).length;
+      if (hit / terms.length < 0.25) {
+        r.warnings.push("deliverable has low term overlap with the task — it may not address the ask");
+      }
+    }
+  }
+}
+
+/** Heuristic: does the deliverable plausibly address one acceptance criterion? */
+function addressesCriterion(c: string, text: string, textLower: string): boolean {
+  const cl = c.toLowerCase();
+  // A structural criterion is judged purely structurally: present → satisfied.
+  if (/\btables?\b|表格/.test(cl)) return /\|.*\|/.test(text);
+  if (/\b(?:cite|citations?|sources?|references?)\b|来源|引用|出处/.test(cl)) return /https?:\/\//.test(text);
+
+  // Otherwise: does the deliverable cover the criterion's meaningful terms?
+  const terms = salientTerms(c);
+  if (terms.length === 0) return textLower.includes(cl.trim()); // Chinese/short → substring
+  const hit = terms.filter((t) => textLower.includes(t)).length;
+  return hit / terms.length >= 0.34;
 }
 
 // --------------------------------------------------------- secrets / leakage

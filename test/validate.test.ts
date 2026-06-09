@@ -56,6 +56,46 @@ describe("validateDeliverable — general task", () => {
   });
 });
 
+describe("validateDeliverable — answer ↔ question match", () => {
+  it("blocks a refusal / non-answer", () => {
+    const r = validateDeliverable({ summary: "I cannot complete this task without more access." }, baseTask());
+    expect(r.errors.some((e) => e.includes("refusal"))).toBe(true);
+  });
+  it("warns when the summary just echoes the task title", () => {
+    const task = baseTask({ title: "Summarize the Q3 earnings call" });
+    const r = validateDeliverable({ summary: "Summarize the Q3 earnings call" }, task);
+    expect(r.warnings.some((w) => w.includes("restates"))).toBe(true);
+  });
+  it("warns when a deliverable ignores an acceptance criterion", () => {
+    const task = baseTask({
+      title: "Compare three databases",
+      params: JSON.stringify({ acceptance_criteria: ["include a comparison table", "cite at least 2 sources"] }),
+    });
+    const r = validateDeliverable({ summary: "Postgres is good.", body: "Postgres is a solid choice." }, task);
+    // No table and no links → both criteria flagged.
+    expect(r.warnings.filter((w) => w.includes("acceptance criterion")).length).toBe(2);
+  });
+  it("passes when the deliverable honors the criteria", () => {
+    const task = baseTask({
+      title: "Compare three databases",
+      params: JSON.stringify({ acceptance_criteria: ["include a comparison table", "cite at least 2 sources"] }),
+    });
+    const body = "## Compare\n| db | speed |\n|----|----|\n| pg | fast |\n\nSee https://a.com and https://b.com";
+    const r = validateDeliverable({ summary: "Compared pg, mysql, sqlite.", body }, task);
+    expect(r.warnings.filter((w) => w.includes("acceptance criterion"))).toEqual([]);
+  });
+  it("warns on low term overlap with the task (no explicit criteria)", () => {
+    const task = baseTask({ title: "Analyze ethereum gas fees in 2025", description: "Focus on EIP-1559 burn dynamics" });
+    const r = validateDeliverable({ summary: "Here is a recipe for banana bread.", body: "Mix flour and sugar." }, task);
+    expect(r.warnings.some((w) => w.includes("term overlap"))).toBe(true);
+  });
+  it("does not run coverage checks when work is behind result_url", () => {
+    const task = baseTask({ title: "Analyze ethereum gas fees", description: "EIP-1559 burn" });
+    const r = validateDeliverable({ summary: "Done.", result_url: "https://gist.github.com/x/y" }, task);
+    expect(r.warnings.some((w) => w.includes("term overlap"))).toBe(false);
+  });
+});
+
 describe("validateDeliverable — on-chain report", () => {
   it("accepts a well-formed report", () => {
     expect(validateDeliverable(goodReport(), onChainTask()).errors).toEqual([]);
