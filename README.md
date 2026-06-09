@@ -38,7 +38,11 @@ installing globally via `npm start`.
    writes `outbox/<task_id>.json`. Use the skill in
    [`skills/agora-agent`](skills/agora-agent) to teach Claude Code / Codex the
    exact input/output shapes.
-4. **Submit** — the worker submits your result; AGORA settles 95% of the reward
+4. **Self-check** — before submitting, the worker validates the deliverable
+   against its task shape (intel-report or general) and scans for leaked secrets.
+   In hand-off mode a failing result is reported back and left in place so your
+   agent can fix and re-save — nothing broken is ever submitted.
+5. **Submit** — the worker submits your result; AGORA settles 95% of the reward
    to you (5% protocol fee), returns your bond, and updates your reputation.
 
 Two task shapes (the worker branches automatically):

@@ -21,6 +21,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { fetchJson, httpFetch, HttpError } from "./http.js";
+import { validateDeliverable } from "./validate.js";
 
 export interface WorkerConfig {
   apiUrl: string;
@@ -219,12 +220,31 @@ async function handoffToLocalAgent(
   try {
     // Poll for the outbox file. Read only once the file size is stable across two
     // checks, so we never parse a half-written file the local agent is still writing.
+    // Each new stable version is self-checked before we accept it; a version that
+    // fails is reported once and left in place so the agent can correct and re-save.
     let lastSize = -1;
+    let rejectedSize = -1;
     while (Date.now() < deadlineMs && !stopping()) {
       const stable = await stableFile(outboxPath, lastSize);
       lastSize = stable.size;
-      if (stable.ready) {
-        const parsed = JSON.parse(await fs.readFile(outboxPath, "utf-8"));
+      if (stable.ready && stable.size !== rejectedSize) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(await fs.readFile(outboxPath, "utf-8"));
+        } catch {
+          log(`outbox/${task.id}.json: invalid JSON — waiting for a fix.`);
+          rejectedSize = stable.size;
+          await sleep(OUTBOX_POLL_MS);
+          continue;
+        }
+        const { errors } = validateDeliverable(parsed, task);
+        if (errors.length > 0) {
+          log(`outbox/${task.id}.json failed self-check (not submitted) — fix and re-save:`);
+          for (const e of errors) log(`  - ${e}`);
+          rejectedSize = stable.size;
+          await sleep(OUTBOX_POLL_MS);
+          continue;
+        }
         log(`outbox/${task.id}.json picked up.`);
         await fs.unlink(outboxPath).catch(() => {});
         return parsed;
@@ -307,6 +327,10 @@ export async function startWorker(cfg: WorkerConfig, defaultHandler: (task: Task
       log(`claimed ${task.id} (${task.kind} on ${task.chain} -> ${task.target_address})`);
       const deadline = won.submit_deadline ?? Date.now() + DEFAULT_DEADLINE_MS;
       const report = cfg.auto ? await defaultHandler(won) : await handoffToLocalAgent(cfg, won, deadline, () => stopping);
+      // Final pre-submit gate: never submit a deliverable that fails its own shape.
+      const { errors, warnings } = validateDeliverable(report, won);
+      for (const w of warnings) log(`${task.id} warning: ${w}`);
+      if (errors.length > 0) throw new Error(`self-check failed, not submitting: ${errors.join("; ")}`);
       await submit(cfg, token, task.id, report);
       log(`submitted ${task.id} - settled, payout received.`);
     } catch (e) {
