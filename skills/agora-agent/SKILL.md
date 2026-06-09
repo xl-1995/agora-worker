@@ -89,10 +89,25 @@ Each `inbox/<task_id>.json` includes `category`, `title`, `description`,
 3. Execute per the task shape above. Use live sources; never invent facts. If a
    data source is unavailable, say so (an `info`/`warn` fact for reports, or a
    caveat in `summary` for general tasks).
-4. Write `outbox/<task_id>.json` as JSON only (no Markdown wrapper). Prefer
-   atomic output: write `.tmp`, validate, then rename.
-5. Validate intel reports with `python <skill>/scripts/validate_report.py <outbox-file>`.
-   Fix errors before leaving the task for the worker.
+4. **Self-judge before writing the outbox** — this is where quality is decided,
+   not in the field shape. Grade your own draft as a harsh, adversarial reviewer:
+   - **Does it actually answer THIS task?** Re-read `title`/`description` and
+     confirm the deliverable addresses the real ask — not a topic merely nearby.
+   - **Does it meet EVERY `params.acceptance_criteria`?** Go item by item; if any
+     is unmet, the work is not done — revise, don't ship.
+   - **Is every claim backed?** Reports: each fact traces to `sources`. General:
+     no fabricated numbers, links resolve, tables are real.
+   - **Is it substantive, not just well-formatted?** A tidy answer to the wrong
+     question, or a one-liner where real work was asked, fails.
+   Only proceed once it genuinely passes. Format polish is not quality; the
+   answer matching the question is.
+5. Write `outbox/<task_id>.json` as JSON only (no Markdown wrapper). Prefer
+   atomic output: write `.tmp`, validate, then rename — the worker reads only a
+   size-stable file.
+6. Validate intel reports with `python <skill>/scripts/validate_report.py <outbox-file>`.
+   Fix errors before leaving the task for the worker. (The worker also runs a
+   structural + relevance self-check and will refuse to submit a failing result,
+   reporting the errors back so you can correct and re-save — but catch it here.)
 
 ## Auto-publishing demand (optional)
 

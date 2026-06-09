@@ -199,6 +199,8 @@ async function handoffToLocalAgent(
   const isOnChain = !!task.target_address;
 
   // Drop the task spec for the local agent to pick up.
+  const params = JSON.parse(task.params || "{}") as Record<string, unknown>;
+  const acceptanceCriteria = params.acceptance_criteria ?? null;
   const spec = {
     task_id: task.id,
     kind: task.kind,
@@ -207,12 +209,13 @@ async function handoffToLocalAgent(
     description: task.description,
     chain: task.chain,
     target_address: task.target_address,
-    params: JSON.parse(task.params || "{}"),
+    params,
+    acceptance_criteria: acceptanceCriteria,
     reward_agio: task.reward_agio,
     deadline_ms: deadlineMs,
     instructions: isOnChain
-      ? "On-chain intelligence task. Analyze the contract at target_address on `chain`. Write the result JSON to outbox/<task_id>.json with fields: { verdict: 'low'|'medium'|'high'|'critical', safety: [...], fund_flow: [...], smart_money: [...], deployer: {...}, assessment: [...], sources: [...] }"
-      : "General task. Do the work described in `title`/`description`. Write the result JSON to outbox/<task_id>.json with fields: { summary: '<one-line result>', result_url?: '<link to deliverable, if any>' }. Do not invent facts; cite sources in the summary when relevant.",
+      ? "On-chain intelligence task. Analyze the contract at target_address on `chain`. Produce a report: { verdict: 'low'|'medium'|'high'|'critical', safety: [...], fund_flow: [...], smart_money: [...], deployer: {...}, assessment: [...], sources: [...] }. SELF-CHECK before writing the outbox file: is every claim backed by a `sources` entry, and does the verdict follow from the safety facts? Revise until it does. Only write outbox/<task_id>.json once it passes."
+      : "General task. Do the work in `title`/`description` and satisfy EVERY item in `acceptance_criteria`. Produce { summary: '<headline>', body: '<full deliverable in Markdown>', attachments?: ['<url>'], result_url?: '<link>' }. SELF-CHECK before writing the outbox file: be your own harsh reviewer — does the deliverable directly answer the task and meet each acceptance criterion (not just look well-formatted)? If it falls short, revise. Only write outbox/<task_id>.json once it passes. Never invent facts; cite sources.",
   };
   await fs.writeFile(inboxPath, JSON.stringify(spec, null, 2));
   log(`inbox/${task.id}.json ready - run your local agent (Codex/Claude Code/etc.) on it.`);
